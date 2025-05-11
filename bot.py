@@ -66,10 +66,12 @@ def run_bot():
             logger.error(f"Error in main loop: {e}")
 
         # timeframe에 맞춰 대기 (예: '1h' → 3600초)
-        unit = cfg['timeframe'][-1]
-        amount = int(cfg['timeframe'][:-1])
-        sleep_secs = amount * (3600 if unit == 'h' else 60)
-        logger.info(f"Waiting for next cycle ({sleep_secs} seconds)...")
+        #unit = cfg['timeframe'][-1]
+        #amount = int(cfg['timeframe'][:-1])
+        #sleep_secs = amount * (3600 if unit == 'h' else 60)
+        sleep_secs = 10 * 60
+        k = time.strftime('%Y.%m.%d - %H:%M:%S')
+        logger.info(f"Waiting for next cycle ({sleep_secs} seconds nowtime:{k})...")
         time.sleep(sleep_secs)
 
 if __name__ == "__main__":
