@@ -1,3 +1,4 @@
 ccxt==4.4.80
 numpy
 pandas
+requests==2.32.3
