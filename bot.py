@@ -78,7 +78,9 @@ def run_bot():
             btc = bal['total']['BTC']
             price = ohlcv[-1][4]
 
-            ema_short, ema_long = params
+            # 이 부분 추가
+            ema_short = int(params['ema_short'])
+            ema_long = int(params['ema_long'])
             short_ma = df['close'].ewm(span=ema_short).mean().iloc[-1]
             long_ma = df['close'].ewm(span=ema_long).mean().iloc[-1]
 
