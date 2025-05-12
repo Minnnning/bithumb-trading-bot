@@ -57,20 +57,19 @@ def run_bot():
     while True:
         try:
             raw = fetch_ohlcv()
-            df  = pd.DataFrame(raw, columns=['ts','o','h','l','c','v'])
-            # 1) 최적 파라미터
-            new_p = optimize_params(df, initial_cap)
-            if new_p != params:
-                params = new_p
+            df = pd.DataFrame(raw, columns=['ts','open','high','low','close','vol'])
+            # 1) 최적 파라미터 계산 
+            new_params = optimize_params(df, initial_cap)
+            if new_params != params:
+                params = new_params
                 msg = f":gear: New EMA params: `{params}`"
                 logger.info(msg); notify_slack(msg)
 
+            # 2) 전략 신호 & 주문
             ohlcv = df.values.tolist()
             bal   = exchange.fetch_balance()
-            krw   = bal['total']['KRW']
-            btc   = bal['total']['BTC']
-            price = ohlcv[-1][4]
-
+            krw, btc = bal['total']['KRW'], bal['total']['BTC']
+            price = df['close'].iloc[-1]
             # 2) 매수
             if should_buy(ohlcv, params) and not in_position and krw > price:
                 amt = (krw / price) * (1 - FEE_RATE)
