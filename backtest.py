@@ -4,8 +4,8 @@ from strategy import should_buy, should_sell
 
 # EMA 단기/장기 그리드
 grid = {
-    'ema_short': [5, 10, 15],
-    'ema_long':  [20, 30, 50],
+    'ema_short': [3, 5, 7],
+    'ema_long':  [10, 20, 30],
 }
 
 def optimize_params(df, initial_capital):
