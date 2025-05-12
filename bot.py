@@ -1,4 +1,4 @@
-#bot.py
+#boy.py
 import ccxt, time, json, logging, requests
 import pandas as pd
 from backtest import optimize_params
@@ -16,133 +16,131 @@ logger = logging.getLogger()
 with open('config.json') as f:
     cfg = json.load(f)
 
-exchange = ccxt.bithumb({
+exchange      = ccxt.bithumb({
     'apiKey': cfg['apiKey'],
     'secret': cfg['secret'],
     'enableRateLimit': True
 })
-symbol = cfg['symbol']
-initial_capital = cfg['initial_capital']
-FEE_RATE = 0.0004
-MAX_RETRIES = 3
-INITIAL_BACKOFF = 1.0
-INTERVAL = cfg.get('interval_seconds', 600)
-SLACK_WEBHOOK = cfg.get('slack_webhook_url')
+symbol        = cfg['symbol']              # e.g. "BTC/KRW", "ETH/KRW", "XRP/KRW" 등
+quote_curr, base_curr = symbol.split('/')  # quote="BTC", base="KRW" 순서 주의!
+# Bithumb CCXT symbol is "BTC/KRW", so left가 base(코인), right가 quote(법정화폐)
+base_currency, quote_currency = symbol.split('/')  
+# 예: base_currency="BTC", quote_currency="KRW"
 
-def notify_slack(message: str):
-    """Slack 알림 전송"""
+initial_cap   = cfg['initial_capital']
+FEE_RATE      = 0.0004
+MAX_RETRIES   = 3
+BACKTEST_LIM  = cfg['backtest_limit']
+TIMEFRAME     = cfg['timeframe']
+INTERVAL_SEC  = cfg['interval_seconds']
+SLACK_WEBHOOK = cfg.get('slack_webhook_url')
+BUY_TOL       = cfg.get('buy_tolerance', 0.001)
+SELL_TOL      = cfg.get('sell_tolerance', 0.001)
+
+def notify_slack(msg: str):
     if not SLACK_WEBHOOK:
         return
     try:
-        resp = requests.post(SLACK_WEBHOOK, json={"text": message})
-        if resp.status_code != 200:
-            logger.error(f"Slack 알림 실패: {resp.status_code} {resp.text}")
+        r = requests.post(SLACK_WEBHOOK, json={"text": msg})
+        if r.status_code != 200:
+            logger.error(f"Slack 알림 실패: {r.status_code} {r.text}")
     except Exception as e:
         logger.error(f"Slack 전송 에러: {e}")
 
-def fetch_ohlcv_with_retry():
-    backoff = INITIAL_BACKOFF
-    for attempt in range(1, MAX_RETRIES + 1):
+def fetch_ohlcv():
+    backoff = 1.0
+    for attempt in range(1, MAX_RETRIES+1):
         try:
-            return exchange.fetch_ohlcv(symbol,
-                                        timeframe=cfg['timeframe'],
-                                        limit=cfg['backtest_limit'])
+            data = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=BACKTEST_LIM)
+            return pd.DataFrame(data, columns=['ts','open','high','low','close','vol'])
         except Exception as e:
-            logger.warning(f"캔들 데이터 로딩 실패 (시도 {attempt}): {e}")
-            if attempt == MAX_RETRIES:
-                logger.error("최대 재시도 초과. 예외 발생.")
-                raise
+            logger.warning(f"OHLCV 로드 실패 ({attempt}/{MAX_RETRIES}): {e}")
             time.sleep(backoff)
             backoff *= 2
+    raise RuntimeError("fetch_ohlcv 실패")
 
 def run_bot():
-    logger.info("=== 봇 시작됨 ===")
-    current_params = None
+    logger.info("=== 트레이딩 봇 시작 ===")
+    params = None
     entry_price = None
+    in_position = False
 
     while True:
         try:
-            # 데이터 로드 & 최적화
-            raw = fetch_ohlcv_with_retry()
-            df = pd.DataFrame(raw, columns=['timestamp','open','high','low','close','volume'])
-            logger.info("EMA 파라미터 백테스트 중...")
-            params = optimize_params(df, initial_capital)
-            if params != current_params:
-                current_params = params
-                logger.info(f"새 EMA 파라미터: {current_params}")
-                notify_slack(f"🔧 새 EMA 파라미터 적용됨: `{current_params}`")
+            # 1) 데이터 & 파라미터 최적화
+            df = fetch_ohlcv()
+            new_p = optimize_params(df, initial_cap)
+            if new_p != params:
+                params = new_p
+                notify_slack(f"🔧 새 EMA 파라미터: `{params}`")
 
-            ohlcv = df.values.tolist()
+            # 2) 잔고 조회
             bal = exchange.fetch_balance()
-            krw = bal['total']['KRW']
-            btc = bal['total']['BTC']
-            price = ohlcv[-1][4]
+            quote_bal = bal['total'].get(quote_currency, 0)  # ex: KRW
+            base_bal  = bal['total'].get(base_currency,  0)  # ex: BTC
 
-            # 이 부분 추가
-            ema_short = int(params['ema_short'])
-            ema_long = int(params['ema_long'])
-            short_ma = df['close'].ewm(span=ema_short).mean().iloc[-1]
-            long_ma = df['close'].ewm(span=ema_long).mean().iloc[-1]
+            price = df['close'].iloc[-1]
+            es = int(params['ema_short'])
+            el = int(params['ema_long'])
+            short_ma = df['close'].ewm(span=es).mean().iloc[-1]
+            long_ma  = df['close'].ewm(span=el).mean().iloc[-1]
 
-            # 손절 체크
-            if entry_price and btc > 0:
-                if (price - entry_price) / entry_price <= -0.03:
-                    order = exchange.create_market_sell_order(symbol, btc)
-                    msg = f"⚠️ 손절 매도: 진입가 {entry_price:.0f} → 현재가 {price:.0f}원, 손실률 {(price - entry_price) / entry_price:.2%}"
-                    logger.info(msg)
-                    notify_slack(msg)
-                    btc = 0
-                    entry_price = None
-                    time.sleep(1)
-                    continue
+            # 3) 매수: EMA 크로스 OR 가격이 EMA_long ± tol 범위 진입
+            buy_signal   = should_buy(df.values.tolist(), params)
+            in_buy_range = abs(price - long_ma) / long_ma <= BUY_TOL
 
-            # 매수 조건
-            if should_buy(ohlcv, current_params) and krw > price:
-                amount = (krw / price) * (1 - FEE_RATE)
+            if not in_position and quote_bal > price and (buy_signal or in_buy_range):
+                amount = (quote_bal / price) * (1 - FEE_RATE)
                 order = exchange.create_market_buy_order(symbol, amount)
                 entry_price = price * (1 + FEE_RATE)
-                msg = f"🚀 매수 실행됨: 가격 {price:.0f}원, 수량 {order['filled']:.6f} BTC"
-                logger.info(msg)
+                in_position = True
+                msg = (f"🚀 매수: {symbol} {price:.0f} {quote_currency} | "
+                       f"{order['filled']:.6f} {base_currency}")
                 notify_slack(msg)
 
-            # 매도 조건
-            elif should_sell(ohlcv, current_params) and btc > 0:
+            # 4) 매도: EMA 크로스 OR 가격이 EMA_long ± tol 범위 진입 또는 손절/수익
+            elif in_position:
+                sell_signal   = should_sell(df.values.tolist(), params)
+                in_sell_range = abs(price - long_ma) / long_ma <= SELL_TOL
                 profit = (price - entry_price) / entry_price
-                if profit >= 0.0008:  # 0.08%
-                    if is_uptrend(df):
-                        logger.info("📈 상승 추세: 매도 보류")
-                        notify_slack("📈 상승 추세로 인해 매도 보류")
+
+                # 손절(-3%)
+                if profit <= -0.03:
+                    order = exchange.create_market_sell_order(symbol, base_bal)
+                    msg = (f"⚠️ 손절매도: {symbol} {price:.0f} {quote_currency} | "
+                           f"{base_bal:.6f} {base_currency}, 손실 {profit:.2%}")
+                    notify_slack(msg)
+                    in_position = False
+
+                # 매도 신호 or 가격 범위 진입
+                elif sell_signal or in_sell_range:
+                    # 수익률 ≥ 0.08%이면서 상승 추세면 보류
+                    if profit >= FEE_RATE*2 and is_uptrend(df):
+                        notify_slack("📈 상승 추세로 매도 보류")
                     else:
-                        order = exchange.create_market_sell_order(symbol, btc)
-                        msg = f"✅ 매도 실행됨: 가격 {price:.0f}원, 수익률 {profit:.2%}, 수량 {order['filled']:.6f} BTC"
-                        logger.info(msg)
+                        order = exchange.create_market_sell_order(symbol, base_bal)
+                        msg = (f"✅ 매도: {symbol} {price:.0f} {quote_currency} | "
+                               f"{base_bal:.6f} {base_currency}, 수익률 {profit:.2%}")
                         notify_slack(msg)
-                        btc = 0
-                        entry_price = None
-                else:
-                    logger.info(f"📉 수익률 {profit:.2%}으로 매도 조건 미충족")
+                        in_position = False
 
-            # 보유 상태(HOLDING)
-            elif btc > 0:
-                expected_profit = price * btc * (1 - FEE_RATE)
-                logger.info(f"🔒 보유 중: 현재가={price:.0f}원, 보유량={btc:.6f}, 예상 매도금액 ≈ {expected_profit:,.0f}원")
-                notify_slack(f"🔒 HOLDING: 현재가 {price:,.0f}원 / 보유 {btc:.6f} BTC → 예상 매도금액 ≈ {expected_profit:,.0f}원")
-
-            # 대기 상태(IDLE)
+            # 5) 상태 알림
+            if not in_position:
+                possible_amt = (quote_bal / price) * (1 - FEE_RATE)
+                msg = (f"⏳ IDLE | {symbol} 현재가 {price:.0f} {quote_currency}, "
+                       f"EMA_long {long_ma:.0f} {quote_currency} ±{BUY_TOL*100:.1f}% "
+                       f"시장가 매수 가능 {possible_amt:.6f} {base_currency}")
             else:
-                desired_entry = long_ma
-                diff_ratio = (price - desired_entry) / desired_entry
-                possible_amount = (krw / price) * (1 - FEE_RATE)
-                msg = f"⏳ 대기 중: 진입 희망가 ≈ EMA_long {desired_entry:,.0f}원, 현재가 {price:,.0f}원 ({diff_ratio:.2%})\n구매 가능 수량 ≈ {possible_amount:.6f} BTC"
-                logger.info(msg)
-                notify_slack(msg)
+                expect_sell = price * base_bal * (1 - FEE_RATE)
+                msg = (f"🔒 HOLDING | {symbol} 진입가 {entry_price:.0f} {quote_currency}, "
+                       f"현재 {price:.0f} {quote_currency}, 예상 매도금 ≈ {expect_sell:,.0f} {quote_currency}")
+            notify_slack(msg)
 
         except Exception as e:
-            logger.error(f"메인 루프 에러: {e}")
-            notify_slack(f"❌ 봇 오류 발생: {e}")
+            notify_slack(f"❌ 봇 오류: {e}")
+            logger.error(f"봇 루프 에러: {e}")
 
-        logger.info(f"{INTERVAL}초 동안 대기...")
-        time.sleep(INTERVAL)
+        time.sleep(INTERVAL_SEC)
 
 if __name__ == "__main__":
     run_bot()
