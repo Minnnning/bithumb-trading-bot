@@ -18,7 +18,7 @@ with open('config.json', 'r', encoding='utf-8') as f:
 
 api_key = config.get('apiKey')
 secret = config.get('secret')
-symbol_base = config.get('symbol')  # e.g. "ETH"
+symbol_base = config.get('symbol')  # e.g. "ETH/KRW"
 interval_seconds = config.get('interval_seconds', 60)
 
 # Initialize Bithumb exchange
@@ -29,7 +29,7 @@ exchange = ccxt.bithumb({
 })
 
 # Prepare market symbol
-market_symbol = f"{symbol_base}/KRW"
+market_symbol = symbol_base
 exchange.load_markets()
 market = exchange.markets.get(market_symbol)
 if not market:

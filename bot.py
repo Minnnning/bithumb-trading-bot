@@ -16,25 +16,25 @@ with open('config.json') as f:
     cfg = json.load(f)
 
 exchange = ccxt.bithumb({
-    'apiKey':         cfg['apiKey'],
-    'secret':         cfg['secret'],
+    'apiKey': cfg['apiKey'],
+    'secret': cfg['secret'],
     'enableRateLimit': True,
 })
 exchange.load_markets()
 
-symbol           = cfg['symbol']             # ex. "ETH/KRW"
-base_curr, quote_curr = symbol.split('/')    # 코인/KRW
-INITIAL_CAP      = cfg['initial_capital']
-FEE_RATE         = 0.0004                    # 0.04%
-MIN_PROFIT       = FEE_RATE * 2              # 0.08%
-STOP_LOSS        = -0.03                     # -3%
-BACKTEST_LIM     = cfg['backtest_limit']
-TIMEFRAME        = cfg['timeframe']
-INTERVAL_SEC     = cfg['interval_seconds']
-SLACK_WEBHOOK    = cfg.get('slack_webhook_url')
-amount_decimals = 8                            # 소수점 8자리 고정
-prec_factor     = 10 ** amount_decimals
-MIN_PURCHASE_KRW = cfg.get('min_purchase_krw', 10000)  # 최소 구매 KRW 기준
+symbol             = cfg['symbol']             # ex. "ETH/KRW"
+base_curr, quote_curr = symbol.split('/')      # 코인/KRW
+INITIAL_CAP        = cfg['initial_capital']
+FEE_RATE           = 0.0004                    # 0.04%
+MIN_PROFIT         = FEE_RATE * 10             # 0.4%
+STOP_LOSS          = -0.03                     # -3%
+BACKTEST_LIM       = cfg['backtest_limit']
+TIMEFRAME          = cfg['timeframe']
+INTERVAL_SEC       = cfg['interval_seconds']
+SLACK_WEBHOOK      = cfg.get('slack_webhook_url')
+amount_decimals    = 8                         # 소수점 8자리 고정
+prec_factor        = 10 ** amount_decimals
+MIN_PURCHASE_KRW   = cfg.get('min_purchase_krw', 10000)
 
 
 def notify_slack(msg: str):
@@ -56,7 +56,8 @@ def fetch_ohlcv():
             return pd.DataFrame(data, columns=['ts','open','high','low','close','vol'])
         except Exception as e:
             logger.warning(f"OHLCV 로드 실패 ({i}/3): {e}")
-            time.sleep(backoff); backoff *= 2
+            time.sleep(backoff)
+            backoff *= 2
     raise RuntimeError("fetch_ohlcv 실패")
 
 
@@ -75,23 +76,25 @@ def run_bot():
                 params = new_p
                 notify_slack(f"🔧 EMA 파라미터 업데이트: `{params}`")
 
-            price       = df['close'].iat[-1]
-            min_units   = MIN_PURCHASE_KRW / price
+            price     = df['close'].iat[-1]
+            min_units = MIN_PURCHASE_KRW / price
 
-            bal         = exchange.fetch_balance()
-            quote_bal   = float(bal['free'].get(quote_curr, 0))
-            base_bal    = float(bal['free'].get(base_curr,  0))
+            bal       = exchange.fetch_balance()
+            quote_bal = float(bal['free'].get(quote_curr, 0))
+            base_bal  = float(bal['free'].get(base_curr,  0))
 
-            closes      = [c[4] for c in ohlcv]
-            es, el      = int(params['ema_short']), int(params['ema_long'])
-            ema_s       = calculate_ema(closes, es)
-            ema_l       = calculate_ema(closes, el)
-            diff_pct    = (ema_s - ema_l) / ema_l
+            closes   = [c[4] for c in ohlcv]
+            es, el   = int(params['ema_short']), int(params['ema_long'])
+            ema_s    = calculate_ema(closes, es)
+            ema_l    = calculate_ema(closes, el)
+            diff_pct = (ema_s - ema_l) / ema_l
 
             # 1) 포지션 중이면 매도/손절 분기
             if in_position:
-                base_bal = float(exchange.fetch_balance()['free'].get(base_curr, 0))
-                profit   = (price - entry_price) / entry_price
+                # 매도 전 잔고, 진입 단가 기록
+                prev_quote = float(exchange.fetch_balance()['free'].get(quote_curr, 0))
+                prev_base  = float(exchange.fetch_balance()['free'].get(base_curr, 0))
+                profit     = (price - entry_price) / entry_price
 
                 logger.info(
                     f"[HOLDING] EMA_s={ema_s:.0f}, EMA_l={ema_l:.0f}, 차이={diff_pct:.2%}, P/L={profit:.2%}"
@@ -99,31 +102,32 @@ def run_bot():
 
                 do_sell = False
                 sell_reason = ''
-                if base_bal > 0 and profit <= STOP_LOSS:
-                    do_sell = True; sell_reason = '손절'
-                elif base_bal > 0 and should_sell(ohlcv, params):
-                    do_sell = True; sell_reason = '알고리즘 시그널'
-                elif base_bal > 0 and profit >= MIN_PROFIT and not is_uptrend(df):
-                    do_sell = True; sell_reason = '수익목표'
-                elif base_bal > 0 and profit >= MIN_PROFIT and is_uptrend(df):
+                if prev_base > 0 and profit <= STOP_LOSS:
+                    do_sell, sell_reason = True, '손절'
+                elif prev_base > 0 and should_sell(ohlcv, params):
+                    do_sell, sell_reason = True, '알고리즘 시그널'
+                elif prev_base > 0 and profit >= MIN_PROFIT and not is_uptrend(df):
+                    do_sell, sell_reason = True, '수익목표'
+                elif prev_base > 0 and profit >= MIN_PROFIT and is_uptrend(df):
                     logger.info("📈 상승추세 감지: 매도 보류")
 
                 if do_sell:
-                    sell_amount = round(base_bal, amount_decimals)
-                    try:
-                        order = exchange.create_order(
-                            symbol=symbol,
-                            type='market',
-                            side='sell',
-                            amount=float(sell_amount),
-                        )
-                        notify_slack(
-                            f"✅ 매도({sell_reason}): {order['filled']:.8f}{base_curr} @ {order['average']:.0f}KRW (P/L {profit:.2%})"
-                        )
-                        in_position = False
-                    except Exception as e:
-                        logger.error(f"매도 주문 에러: {e}")
-                        notify_slack(f"❌ 매도 실패: {e}")
+                    sell_amount = round(prev_base, amount_decimals)
+                    order = exchange.create_market_sell_order(symbol, sell_amount)
+                    # 매도 후 잔고 변화로 체결량, 수익 계산
+                    post_base  = float(exchange.fetch_balance()['free'].get(base_curr, 0))
+                    post_quote = float(exchange.fetch_balance()['free'].get(quote_curr, 0))
+                    filled     = prev_base - post_base
+                    sold_krw   = post_quote - prev_quote
+                    profit_amt = sold_krw - (entry_price * filled)
+
+                    logger.info(
+                        f"✅ 매도({sell_reason}): {filled:.8f}{base_curr} @ {price:.0f}KRW | P/L={profit:.2%}, 이익={profit_amt:.0f}KRW"
+                    )
+                    notify_slack(
+                        f"✅ 매도({sell_reason}): {filled:.8f}{base_curr} @ {price:.0f}KRW | P/L={profit:.2%}, 이익={profit_amt:.0f}KRW"
+                    )
+                    in_position = False
                 time.sleep(INTERVAL_SEC)
                 continue
 
@@ -135,33 +139,28 @@ def run_bot():
                 units      = round(steps / prec_factor, amount_decimals)
 
                 logger.info(
-                    f"[매수 시도] 잔고={quote_bal:.0f}KRW, 예상수량={units:.8f}{base_curr}, EMA_s={ema_s:.0f}, EMA_l={ema_l:.0f}, 차이= {diff_pct:.2%}"
+                    f"[매수 시도] 잔고={quote_bal:.0f}KRW, 예상수량={units:.8f}{base_curr}, EMA_s={ema_s:.0f}, EMA_l={ema_l:.0f}, 차이={diff_pct:.2%}"
                 )
 
                 if units >= min_units:
-                    try:
-                        order = exchange.create_order(
-                            symbol=symbol,
-                            type='market',
-                            side='buy',
-                            amount=float(units),
-                        )
-                        new_base = exchange.fetch_balance()[base_curr]['free']
-                        filled   = new_base - quote_bal 
-                        # 2) cost는 price * filled
-                        spent_krw = filled * price
-                        entry_price = price
-                        
-                        in_position = True
-                        logger.info(
-                            f"🚀 매수 체결: {filled:.8f}{base_curr} @ {entry_price:.0f}KRW (지출 {spent_krw:.0f}KRW)"
-                        )
-                        notify_slack(
-                            f"🚀 매수 체결: {filled:.8f}{base_curr} @ {entry_price:.0f}KRW (지출 {spent_krw:.0f}KRW)"
-                        )
-                    except Exception as e:
-                        logger.error(f"매수 주문 에러: {e}")
-                        notify_slack(f"❌ 매수 실패: {e}")
+                    # 매수 전 잔고 기록
+                    prev_base  = float(exchange.fetch_balance()['free'].get(base_curr, 0))
+                    prev_quote = float(exchange.fetch_balance()['free'].get(quote_curr, 0))
+
+                    order = exchange.create_market_buy_order(symbol, units)
+                    post_base  = float(exchange.fetch_balance()['free'].get(base_curr, 0))
+                    post_quote = float(exchange.fetch_balance()['free'].get(quote_curr, 0))
+                    filled     = post_base - prev_base
+                    spent_krw  = prev_quote - post_quote
+                    entry_price = price
+
+                    logger.info(
+                        f"🚀 매수 체결: {filled:.8f}{base_curr} @ {price:.0f}KRW | 지출={spent_krw:.0f}KRW"
+                    )
+                    notify_slack(
+                        f"🚀 매수 체결: {filled:.8f}{base_curr} @ {price:.0f}KRW | 지출={spent_krw:.0f}KRW"
+                    )
+                    in_position = True
                 else:
                     logger.info(f"⚠️ 매수 스킵: 최소 구매 단위 미달 ({units:.8f} < {min_units:.8f})")
                 time.sleep(INTERVAL_SEC)
