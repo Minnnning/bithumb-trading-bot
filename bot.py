@@ -1,7 +1,8 @@
 import ccxt, time, json, logging, requests, math
 import pandas as pd
+import numpy as np
 from backtest import optimize_params
-from strategy import should_buy, should_sell, is_uptrend, calculate_ema
+from strategy import should_buy, should_sell, is_uptrend, calculate_ema, calculate_rsi
 
 # ─── 로깅 설정 ─────────────────────────────────────────────
 logging.basicConfig(
@@ -22,17 +23,17 @@ exchange = ccxt.bithumb({
 })
 exchange.load_markets()
 
-symbol             = cfg['symbol']             # ex. "ETH/KRW"
-base_curr, quote_curr = symbol.split('/')      # 코인/KRW
+symbol             = cfg['symbol']
+base_curr, quote_curr = symbol.split('/')
 INITIAL_CAP        = cfg['initial_capital']
-FEE_RATE           = 0.0004                    # 0.04%
-MIN_PROFIT         = FEE_RATE * 10             # 0.4%
-STOP_LOSS          = -0.03                     # -3%
+FEE_RATE           = 0.0004
+MIN_PROFIT         = FEE_RATE * 10
+STOP_LOSS          = -0.03
 BACKTEST_LIM       = cfg['backtest_limit']
 TIMEFRAME          = cfg['timeframe']
 INTERVAL_SEC       = cfg['interval_seconds']
 SLACK_WEBHOOK      = cfg.get('slack_webhook_url')
-amount_decimals    = 8                         # 소수점 8자리 고정
+amount_decimals    = 8
 prec_factor        = 10 ** amount_decimals
 MIN_PURCHASE_KRW   = cfg.get('min_purchase_krw', 10000)
 
@@ -60,9 +61,8 @@ def fetch_ohlcv():
             backoff *= 2
     raise RuntimeError("fetch_ohlcv 실패")
 
-
 def run_bot():
-    logger.info("=== 트레이딩 봇 시작 ===")
+    notify_slack("=== 트레이딩 봇 시작 ===")
     params      = None
     entry_price = None
     in_position = False
@@ -74,30 +74,30 @@ def run_bot():
             new_p   = optimize_params(df, INITIAL_CAP)
             if new_p != params:
                 params = new_p
-                notify_slack(f"🔧 EMA 파라미터 업데이트: `{params}`")
+                logger.info(f"🔧 EMA 파라미터 업데이트: `{params}`")
 
-            price     = df['close'].iat[-1]
+            closes   = df['close'].tolist()
+            price    = closes[-1]
+            rsi      = calculate_rsi(closes, int(params['rsi_period']))
             min_units = MIN_PURCHASE_KRW / price
 
             bal       = exchange.fetch_balance()
             quote_bal = float(bal['free'].get(quote_curr, 0))
             base_bal  = float(bal['free'].get(base_curr,  0))
 
-            closes   = [c[4] for c in ohlcv]
-            es, el   = int(params['ema_short']), int(params['ema_long'])
-            ema_s    = calculate_ema(closes, es)
-            ema_l    = calculate_ema(closes, el)
-            diff_pct = (ema_s - ema_l) / ema_l
+            es, el    = int(params['ema_short']), int(params['ema_long'])
+            ema_s     = calculate_ema(closes, es)
+            ema_l     = calculate_ema(closes, el)
+            diff_pct  = (ema_s - ema_l) / ema_l
 
             # 1) 포지션 중이면 매도/손절 분기
             if in_position:
-                # 매도 전 잔고, 진입 단가 기록
-                prev_quote = float(exchange.fetch_balance()['free'].get(quote_curr, 0))
-                prev_base  = float(exchange.fetch_balance()['free'].get(base_curr, 0))
+                prev_quote = quote_bal
+                prev_base  = base_bal
                 profit     = (price - entry_price) / entry_price
 
                 logger.info(
-                    f"[HOLDING] EMA_s={ema_s:.0f}, EMA_l={ema_l:.0f}, 차이={diff_pct:.2%}, P/L={profit:.2%}"
+                    f"[HOLDING] EMA_s={ema_s:.0f}, EMA_l={ema_l:.0f}, RSI={rsi:.1f}, P/L={profit:.2%}"
                 )
 
                 do_sell = False
@@ -114,11 +114,9 @@ def run_bot():
                 if do_sell:
                     sell_amount = round(prev_base, amount_decimals)
                     order = exchange.create_market_sell_order(symbol, sell_amount)
-                    # 매도 후 잔고 변화로 체결량, 수익 계산
-                    post_base  = float(exchange.fetch_balance()['free'].get(base_curr, 0))
-                    post_quote = float(exchange.fetch_balance()['free'].get(quote_curr, 0))
-                    filled     = prev_base - post_base
-                    sold_krw   = post_quote - prev_quote
+                    post = exchange.fetch_balance()
+                    filled     = prev_base - float(post['free'].get(base_curr, 0))
+                    sold_krw   = float(post['free'].get(quote_curr, 0)) - prev_quote
                     profit_amt = sold_krw - (entry_price * filled)
 
                     logger.info(
@@ -131,27 +129,23 @@ def run_bot():
                 time.sleep(INTERVAL_SEC)
                 continue
 
-            # 2) 포지션 없으면 매수 분기
-            if should_buy(ohlcv, params) or ema_s > ema_l:
+            # 2) 포지션 없으면 매수 분기 (EMA 골든 크로스 + RSI 필터)
+            if (should_buy(ohlcv, params) or ema_s > ema_l) and rsi < int(params['rsi_threshold']):
                 usable_krw = quote_bal * 0.7
                 raw_units  = usable_krw / price
                 steps      = math.floor(raw_units * prec_factor)
                 units      = round(steps / prec_factor, amount_decimals)
 
                 logger.info(
-                    f"[매수 시도] 잔고={quote_bal:.0f}KRW, 예상수량={units:.8f}{base_curr}, EMA_s={ema_s:.0f}, EMA_l={ema_l:.0f}, 차이={diff_pct:.2%}"
+                    f"[매수 시도] 잔고={quote_bal:.0f}KRW, 예상수량={units:.8f}{base_curr}, RSI={rsi:.1f}, EMA_cross_diff={diff_pct:.2%}"
                 )
 
                 if units >= min_units:
-                    # 매수 전 잔고 기록
-                    prev_base  = float(exchange.fetch_balance()['free'].get(base_curr, 0))
-                    prev_quote = float(exchange.fetch_balance()['free'].get(quote_curr, 0))
-
+                    prev = exchange.fetch_balance()
                     order = exchange.create_market_buy_order(symbol, units)
-                    post_base  = float(exchange.fetch_balance()['free'].get(base_curr, 0))
-                    post_quote = float(exchange.fetch_balance()['free'].get(quote_curr, 0))
-                    filled     = post_base - prev_base
-                    spent_krw  = prev_quote - post_quote
+                    post = exchange.fetch_balance()
+                    filled     = float(post['free'].get(base_curr, 0)) - prev['free'].get(base_curr, 0)
+                    spent_krw  = prev['free'].get(quote_curr, 0) - float(post['free'].get(quote_curr, 0))
                     entry_price = price
 
                     logger.info(
@@ -167,7 +161,9 @@ def run_bot():
                 continue
 
             # 3) IDLE 상태
-            logger.info(f"[IDLE] EMA_s={ema_s:.0f}, EMA_l={ema_l:.0f}, 차이={diff_pct:.2%}")
+            logger.info(
+                f"[IDLE] EMA_s={ema_s:.0f}, EMA_l={ema_l:.0f}, RSI={rsi:.1f}, EMA_diff={diff_pct:.2%}"
+            )
             time.sleep(INTERVAL_SEC)
 
         except Exception as e:
