@@ -1,0 +1,11 @@
+{
+  "apiKey": "API 키: 빗썸에서 발급받은 API 키입니다.",
+  "secret": "시크릿 키: 빗썸 API에 접근하기 위한 비밀 키입니다.",
+  "symbol": "BTC/KRW or ETH/KRW",
+  "backtest_limit": "백테스트 시 사용할 캔들 수: 최근 몇 개의 캔들을 분석할지 정합니다. 200 정수로 작성",
+  "timeframe": "캔들 데이터의 시간 간격: 1m, 5m, 1h, 1d 등 사용 가능합니다.",
+  "initial_capital": "백테스트에 사용할 가상의 초기 투자금 (KRW 기준)",
+  "slack_webhook_url": "슬랙 웹훅 URL: 트레이딩 봇이 알림을 보낼 슬랙 Webhook 주소입니다.",
+  "interval_seconds": "트레이딩 봇의 반복 주기 (초): 매 몇 초마다 시장 상태를 확인하고 판단할지 정합니다. 60",
+  "update_seconds": "EMA 파라미터 재탐색 주기 (초): EMA 매개변수를 재계산할 주기입니다. 3600"
+}
